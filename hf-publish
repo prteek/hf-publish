@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# hf publish: stage a project's files and upload them to Hugging Face repos and buckets, as its publish.toml describes.
+# An hf CLI extension: install with `hf extensions install prteek/hf-publish`, run as `hf publish`.
+# Runs on bash 3.2 (macOS /bin/bash) and up. Reads publish.toml with Python's tomllib (Python 3.11+).
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: hf publish [-m MESSAGE] [-n] [-l] [TARGET ...]
+
+Publish a project's targets to Hugging Face as its publish.toml describes (found in the current folder or the
+nearest folder above). With no targets, publishes the config's `default` list (or every target).
+
+Targets are the config's [targets.<name>] tables. Every repo target also has a `<name>-card` target that uploads
+only the README.md the target puts at its root (its card).
+
+Options:
+  -m, --message MESSAGE  commit message (default: Update)
+  -n, --dry-run          run builds and stage files, then print the hf commands and staged files instead of uploading
+  -l, --list             list the targets and exit
+  -h, --help             show this help
+
+Environment:
+  HF_CLI            the hf command to upload with (default: `hf` if on PATH, else `uvx --from huggingface_hub hf`)
+  HF_PUBLISH_PYTHON a Python 3.11+ to read publish.toml with (default: python3 or python, else `uv run`)
+
+publish.toml:
+  default = ["dataset", "space"]       # optional: targets published when none are given
+
+  [targets.dataset]
+  repo = "user/name"
+  type = "dataset"                     # model, dataset or space
+  build = "python make.py \"$STAGE\""  # optional: shell command run from the project folder before copying;
+                                       # $STAGE is the target's staging folder (the repo's root)
+  [targets.dataset.files]              # repo folder -> files copied into it (globs allowed; "." is the root)
+  "." = ["dataset/README.md", "data/*.csv"]
+
+  [targets.blog]
+  type = "bucket"
+  bucket = "user/assets/project"       # synced to hf://buckets/<bucket>
+  dir = "blog/assets"                  # local folder to sync
+EOF
+}
+
+die() { echo "hf publish: $*" >&2; exit 1; }
+
+msg=Update
+dry_run=0
+list=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--message) [ $# -ge 2 ] || die "$1 needs a value"; msg=$2; shift 2 ;;
+    --message=*) msg=${1#*=}; shift ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    -l|--list) list=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 (see hf publish --help)" ;;
+    *) break ;;
+  esac
+done
+
+# The project folder: the nearest folder (from here up) with a publish.toml.
+root=$PWD
+until [ -f "$root/publish.toml" ]; do
+  [ "$root" != / ] || die "no publish.toml in $PWD or any folder above it"
+  root=$(dirname "$root")
+done
+cd "$root"
+
+# A Python with tomllib, to read the config.
+py=()
+for p in ${HF_PUBLISH_PYTHON:+"$HF_PUBLISH_PYTHON"} python3 python; do
+  if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import tomllib' 2>/dev/null; then py=("$p"); break; fi
+done
+if [ ${#py[@]} -eq 0 ]; then
+  command -v uv >/dev/null 2>&1 || die "needs Python 3.11+ (for tomllib) or uv to read publish.toml"
+  py=(uv run --no-project --python '>=3.11' python)
+fi
+
+# Read and check the config. Sets cfg_names, cfg_default and, for target i, cfg_type_i, cfg_repo_i, cfg_build_i,
+# cfg_dir_i and cfg_files_i (pairs: repo folder, source pattern). The Python is read into a variable first: bash 3.2
+# misparses a heredoc with unbalanced parentheses inside $(...).
+read -r -d '' read_config <<'PY' || true
+import shlex, sys, tomllib
+
+def fail(message):
+    print(f"echo {shlex.quote('publish.toml: ' + message)} >&2; exit 2")
+    sys.exit()
+
+def arr(xs):
+    return "(" + " ".join(shlex.quote(str(x)) for x in xs) + ")"
+
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except tomllib.TOMLDecodeError as e:
+    fail(str(e))
+
+if unknown := set(cfg) - {"default", "targets"}:
+    fail(f"unknown key(s): {', '.join(sorted(unknown))}")
+targets = cfg.get("targets")
+if not isinstance(targets, dict) or not targets:
+    fail("no [targets.<name>] tables")
+names = list(targets)
+default = cfg.get("default", names)
+if not isinstance(default, list) or not all(n in targets for n in default):
+    fail("default must list target names")
+
+out = [f"cfg_names={arr(names)}", f"cfg_default={arr(default)}"]
+for i, (name, t) in enumerate(targets.items()):
+    if name.endswith("-card"):
+        fail(f"target {name}: names ending in -card are reserved for card uploads")
+    kind = t.get("type")
+    if kind == "bucket":
+        allowed, required = {"type", "bucket", "dir"}, ("bucket", "dir")
+    elif kind in ("model", "dataset", "space"):
+        allowed, required = {"type", "repo", "build", "files"}, ("repo",)
+    else:
+        fail(f"target {name}: type must be model, dataset, space or bucket")
+    if unknown := set(t) - allowed:
+        fail(f"target {name}: unknown key(s) for a {kind} target: {', '.join(sorted(unknown))}")
+    for key in required:
+        if not isinstance(t.get(key), str) or not t[key]:
+            fail(f"target {name}: needs {key}")
+    files = t.get("files", {})
+    if not isinstance(files, dict) or not all(
+        isinstance(v, list) and all(isinstance(s, str) for s in v) for v in files.values()
+    ):
+        fail(f"target {name}: files must map repo folders to lists of paths")
+    if kind != "bucket" and not files and "build" not in t:
+        fail(f"target {name}: needs files or a build")
+    pairs = [x for dest, srcs in files.items() for src in srcs for x in (dest, src)]
+    out += [
+        f"cfg_type_{i}={shlex.quote(kind)}",
+        f"cfg_repo_{i}={shlex.quote(t.get('repo') or t.get('bucket'))}",
+        f"cfg_build_{i}={shlex.quote(t.get('build', ''))}",
+        f"cfg_dir_{i}={shlex.quote(t.get('dir', ''))}",
+        f"cfg_files_{i}={arr(pairs)}",
+    ]
+print("\n".join(out))
+PY
+config=$("${py[@]}" -c "$read_config" publish.toml) || die "could not read publish.toml"
+eval "$config"
+
+index_of() {  # index_of NAME: the target's index in cfg_names, or nothing
+  local i
+  for i in "${!cfg_names[@]}"; do
+    if [ "${cfg_names[$i]}" = "$1" ]; then echo "$i"; return; fi
+  done
+}
+
+if [ "$list" = 1 ]; then
+  for i in "${!cfg_names[@]}"; do
+    eval "printf '%-14s %-8s %s\n' \"\${cfg_names[$i]}\" \"\$cfg_type_$i\" \"\$cfg_repo_$i\""
+  done
+  exit 0
+fi
+
+if [ $# -gt 0 ]; then targets=("$@"); else targets=("${cfg_default[@]}"); fi
+for t in "${targets[@]}"; do  # check them all before publishing any
+  [ -n "$(index_of "${t%-card}")" ] || die "unknown target: $t (targets: ${cfg_names[*]}; see hf publish --list)"
+  if [ "$t" != "${t%-card}" ]; then
+    eval "[ \"\$cfg_type_$(index_of "${t%-card}")\" != bucket ]" || die "$t: a bucket target has no card"
+  fi
+done
+
+if [ -n "${HF_CLI:-}" ]; then
+  read -r -a hf <<< "$HF_CLI"
+elif command -v hf >/dev/null 2>&1; then
+  hf=(hf)
+else
+  hf=(uvx --from huggingface_hub hf)
+fi
+[ "$dry_run" = 0 ] || hf=(echo "${hf[@]}")
+
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+shopt -s nullglob
+
+for t in "${targets[@]}"; do
+  name=${t%-card}
+  i=$(index_of "$name")
+  eval "type=\$cfg_type_$i repo=\$cfg_repo_$i build=\$cfg_build_$i dir=\$cfg_dir_$i"
+  eval "files=(\${cfg_files_$i[@]+\"\${cfg_files_$i[@]}\"})"
+  echo "==> $t" >&2
+
+  if [ "$type" = bucket ]; then
+    [ -d "$dir" ] || die "$t: no folder $dir"
+    "${hf[@]}" buckets sync "$dir" "hf://buckets/$repo"
+    continue
+  fi
+
+  if [ "$t" != "$name" ]; then  # <name>-card: only the README.md the target puts at its root
+    card=
+    for ((k = 0; k < ${#files[@]}; k += 2)); do
+      if [ "${files[k]}" = . ] && [ "$(basename "${files[k+1]}")" = README.md ]; then card=${files[k+1]}; fi
+    done
+    [ -n "$card" ] || die "$t: target $name puts no README.md at its root"
+    "${hf[@]}" upload "$repo" "$card" README.md --repo-type "$type" --commit-message "$msg"
+    continue
+  fi
+
+  dest=$stage/$name
+  mkdir -p "$dest"
+  if [ -n "$build" ]; then
+    STAGE=$dest bash -euo pipefail -c "$build" || die "$t: build failed"
+  fi
+  for ((k = 0; k < ${#files[@]}; k += 2)); do
+    folder=$dest/${files[k]}
+    # shellcheck disable=SC2206  # unquoted on purpose: the source may be a glob
+    matches=(${files[k+1]})
+    [ ${#matches[@]} -gt 0 ] || die "$t: no file matches ${files[k+1]}"
+    mkdir -p "$folder"
+    cp -R "${matches[@]}" "$folder/"
+  done
+  if [ "$dry_run" = 1 ]; then
+    (cd "$dest" && find . -type f | sed 's|^\./|    |' | sort) >&2
+  fi
+  "${hf[@]}" upload "$repo" "$dest" . --repo-type "$type" --commit-message "$msg"
+done
